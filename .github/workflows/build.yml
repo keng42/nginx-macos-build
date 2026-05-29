@@ -1,0 +1,149 @@
+name: Build nginx for macOS arm64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    env:
+      # Pin versions and verified SHA-256 together.
+      NGINX_VERSION: "1.30.2"
+      OPENSSL_VERSION: "3.5.6"
+      PCRE2_VERSION: "10.47"
+      ZLIB_VERSION: "1.3.2"
+
+      NGINX_SHA256: "f9f8dbd223c3eb81fd4e1df79f79559ee2a9929a2c73dde762c87055c650b6ef"
+      OPENSSL_SHA256: "35d01043ab0e675fcd8422de2c6b89be84c148483d29c9adf7e2a486516fc6a6"
+      PCRE2_SHA256: "113b9d73680472e3d7e51e7e4c6bce9b48a9a1db4d986adcea17a35ac97a5326"
+      ZLIB_SHA256: "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16"
+
+    steps:
+      - name: Check runner architecture
+        run: |
+          set -euo pipefail
+
+          test "$(uname -m)" = "arm64"
+          sw_vers
+          clang --version
+          make --version
+          gh --version
+
+      - name: Download sources
+        run: |
+          set -euo pipefail
+
+          mkdir -p src dist
+          cd src
+
+          curl --fail --location --show-error --silent --remote-name \
+            "https://github.com/nginx/nginx/releases/download/release-${NGINX_VERSION}/nginx-${NGINX_VERSION}.tar.gz"
+
+          curl --fail --location --show-error --silent --remote-name \
+            "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+
+          curl --fail --location --show-error --silent --remote-name \
+            "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${PCRE2_VERSION}/pcre2-${PCRE2_VERSION}.tar.gz"
+
+          curl --fail --location --show-error --silent --remote-name \
+            "https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz"
+
+      - name: Verify source checksums
+        run: |
+          set -euo pipefail
+
+          cd src
+
+          echo "${NGINX_SHA256}  nginx-${NGINX_VERSION}.tar.gz" | shasum -a 256 -c -
+          echo "${OPENSSL_SHA256}  openssl-${OPENSSL_VERSION}.tar.gz" | shasum -a 256 -c -
+          echo "${PCRE2_SHA256}  pcre2-${PCRE2_VERSION}.tar.gz" | shasum -a 256 -c -
+          echo "${ZLIB_SHA256}  zlib-${ZLIB_VERSION}.tar.gz" | shasum -a 256 -c -
+
+      - name: Extract sources
+        run: |
+          set -euo pipefail
+
+          cd src
+
+          tar -xzf "nginx-${NGINX_VERSION}.tar.gz"
+          tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
+          tar -xzf "pcre2-${PCRE2_VERSION}.tar.gz"
+          tar -xzf "zlib-${ZLIB_VERSION}.tar.gz"
+
+      - name: Configure and build nginx
+        run: |
+          set -euo pipefail
+
+          cd "src/nginx-${NGINX_VERSION}"
+
+          ./configure \
+            --prefix="." \
+            --sbin-path="nginx" \
+            --conf-path="conf/nginx.conf" \
+            --pid-path="run/nginx.pid" \
+            --error-log-path="logs/error.log" \
+            --http-log-path="logs/access.log" \
+            --http-client-body-temp-path="tmp/client_body" \
+            --http-proxy-temp-path="tmp/proxy" \
+            --http-fastcgi-temp-path="tmp/fastcgi" \
+            --http-uwsgi-temp-path="tmp/uwsgi" \
+            --http-scgi-temp-path="tmp/scgi" \
+            --with-http_ssl_module \
+            --with-http_v2_module \
+            --with-http_stub_status_module \
+            --with-pcre="../pcre2-${PCRE2_VERSION}" \
+            --with-pcre-jit \
+            --with-zlib="../zlib-${ZLIB_VERSION}" \
+            --with-openssl="../openssl-${OPENSSL_VERSION}" \
+            --with-openssl-opt="no-tests"
+
+          make -j"$(sysctl -n hw.ncpu)"
+
+          cp objs/nginx ../../dist/nginx-macos-arm64
+          chmod +x ../../dist/nginx-macos-arm64
+
+      - name: Inspect binary dependencies
+        run: |
+          set -euo pipefail
+
+          file dist/nginx-macos-arm64
+          otool -L dist/nginx-macos-arm64
+          dist/nginx-macos-arm64 -V
+
+          file dist/nginx-macos-arm64 | grep -q "arm64"
+
+          if otool -L dist/nginx-macos-arm64 | grep -E '/opt/homebrew|/usr/local|libssl|libcrypto|libpcre|libz'; then
+            echo "Unexpected external dynamic dependency detected."
+            exit 1
+          fi
+
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+
+          cd dist
+
+          shasum -a 256 nginx-macos-arm64 > SHA256SUMS
+
+          tar -czf "nginx-${NGINX_VERSION}-macos-arm64.tar.gz" \
+            nginx-macos-arm64 \
+            SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: nginx-${{ env.NGINX_VERSION }}-macos-arm64
+        run: |
+          set -euo pipefail
+
+          gh release create "$TAG" \
+            "dist/nginx-macos-arm64" \
+            "dist/SHA256SUMS" \
+            "dist/nginx-${NGINX_VERSION}-macos-arm64.tar.gz" \
+            --target "$GITHUB_SHA" \
+            --title "nginx ${NGINX_VERSION} for macOS arm64" \
+            --notes "Native macOS arm64 build of nginx ${NGINX_VERSION} with statically built OpenSSL ${OPENSSL_VERSION}, PCRE2 ${PCRE2_VERSION}, and zlib ${ZLIB_VERSION}."
